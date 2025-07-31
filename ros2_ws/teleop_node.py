@@ -1,46 +1,62 @@
-from sensor_msgs.msg import Joy
-from std_msgs.msg import Float64MultiArray, Bool
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from pymycobot.mycobot import MyCobot
 
 class MyCobotTeleop(Node):
     def __init__(self):
         super().__init__('mycobot_teleop')
-        self.subscription = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
-        
-        self.coord_pub = self.create_publisher(Float64MultiArray, '/mycobot/coords', 10)
-        self.gripper_pub = self.create_publisher(Bool, '/mycobot/gripper', 10)
+        # Parameters for serial port, etc.
+        port = self.declare_parameter('port', '/dev/ttyAMA0').get_parameter_value().string_value
+        baud = self.declare_parameter('baud', 115200).get_parameter_value().integer_value
 
-        self.coords = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # x, y, z, rx, ry, rz
-        self.step_pos = 5.0      # mm step
-        self.step_rot = 5.0      # deg step
+        # Connect to myCobot hardware
+        self.mc = MyCobot(port, baud)
+        # Get current coords as starting target (x, y, z in mm, rx, ry, rz in deg)
+        self.target_coords = self.mc.get_coords()  # e.g. [x,y,z,rx,ry,rz]
 
-    def joy_callback(self, msg: Joy):
-        # Left stick: x, y
-        self.coords[0] += msg.axes[0] * self.step_pos
-        self.coords[1] += msg.axes[1] * self.step_pos
+        # Teleop tuning parameters
+        self.declare_parameter('step_time', 0.1)  # control loop period in seconds
+        self.step_time = self.get_parameter('step_time').get_parameter_value().double_value
+        self.max_linear = 50.0   # mm/s max speed for translations (scaled by joystick)
+        self.max_yaw = 30.0      # deg/s max speed for yaw rotation
 
-        # Right stick: z, rx
-        self.coords[2] += msg.axes[4] * self.step_pos
-        self.coords[3] += msg.axes[3] * self.step_rot
+        # Subscribe to Twist commands
+        self.subscription = self.create_subscription(Twist, 'cmd_vel', self.twist_callback, 10)
+        # Timer for sending repeated commands at fixed rate
+        self.timer = self.create_timer(self.step_time, self.send_command)
+        self.joy_active = False  # whether we have a recent command
 
-        # D-pad or buttons (example): gripper control
-        if msg.buttons[0] == 1:  # A
-            self.gripper_pub.publish(Bool(data=True))  # open
-        if msg.buttons[1] == 1:  # B
-            self.gripper_pub.publish(Bool(data=False))  # close
+    def twist_callback(self, msg: Twist):
+        # Convert Twist input to target coordinate offsets
+        dt = self.step_time
+        self.joy_active = True
+        dx = msg.linear.x * 1000.0 * dt  # m->mm
+        dy = msg.linear.y * 1000.0 * dt
+        dz = msg.linear.z * 1000.0 * dt
+        dyaw = msg.angular.z * (180.0/3.14159) * dt  # rad->deg
+        # Update target coords (assuming base frame axes)
+        self.target_coords[0] += dx   # X (mm)
+        self.target_coords[1] += dy   # Y (mm)
+        self.target_coords[2] += dz   # Z (mm)
+        self.target_coords[5] += dyaw # Rz (deg) - adjust end-effector yaw
+        # Optional: clamp target_coords to safe workspace bounds here
 
-        # Send coords
-        coord_msg = Float64MultiArray()
-        coord_msg.data = self.coords
-        self.coord_pub.publish(coord_msg)
+    def send_command(self):
+        if not self.joy_active:
+            # No joystick input, do nothing (or could slow to a stop)
+            return
+        # Send the new target coordinates to the robot at a given speed (e.g. 50% speed, linear path)
+        try:
+            self.mc.send_coords(self.target_coords, 50, 1)  # 50% speed, mode=1 (linear) [oai_citation:15‡docs.elephantrobotics.com](https://docs.elephantrobotics.com/docs/gitbook-en/7-ApplicationBasePython/7.3_coord.html#:~:text=,Return%20Value%3A%20None)
+        except Exception as e:
+            self.get_logger().error(f"Failed to send coords: {e}")
+        # Reset flag so we only continue sending if new Twist msgs keep coming
+        self.joy_active = False
 
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = MyCobotTeleop()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
